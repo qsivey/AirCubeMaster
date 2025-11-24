@@ -10,79 +10,173 @@
 #include "driver/spi_slave.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
+#include "lwipopts.h"
 #include "nvs_flash.h"
-#include "esp_log.h"gpt
+#include "esp_log.h"
 #include "driver/gpio.h"
+#include "lwip/err.h"
+#include "lwip/sys.h"
 #include "lwip/sockets.h"
 #include "esp_mac.h"   
 #include "driver/i2c_master.h"
+#include "driver/i2s.h"
 #include "driver/i2s_std.h"
 #include "hal/i2s_types.h"
 #include "driver/i2s_tdm.h"
-#include "math.h"
+#include "adjunct.h"
+#include "driver/periph_ctrl.h"
+#include "esp_intr_alloc.h"
+#include "portmacro.h"
+#include "soc/i2s_struct.h"
+#include "soc/i2s_reg.h"
+#include "soc/dport_reg.h"
+#include "esp_attr.h"
+
+#include <math.h>
+#include <stdint.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <string.h>
+#include <errno.h>
+#include "esp_crc.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+#include "sys/time.h"
 
 #define S3_MASTER
 
 /* Wi-Fi */
-#define WIFI_SSID      	"AirCube"
-#define WIFI_PASS      	"1kT45678ex"
-#define MAX_STA_CONN   	4
+#define WIFI_SSID      				"AirCube"
+#define WIFI_PASS      				"12345678"
+#define MAX_STA_CONN				4
 
-#define SERVER_IP      	"192.168.4.1"   
-#define SERVER_PORT    	3333   
+#define MAXIMUM_RETRY				10
+
+#define WIFI_CONNECTED_BIT 			BIT0
+#define WIFI_FAIL_BIT      			BIT1
+
+#define BROADCAST_IP 				"192.168.4.255"
+#define SLAVE_IP     				"192.168.4.2"
+#define SERVER_IP      				"192.168.4.1"   
+#define SERVER_PORT    				3333   
         
 /* Pins */   
-#define PIN_MISO  		37
-#define PIN_MOSI  		38
-#define PIN_SCLK		36
-#define PIN_CS    		40
+#define PIN_MISO  					37
+#define PIN_MOSI  					38
+#define PIN_SCLK					36
+#define PIN_CS    					40
 
-#define I2S_BCLK 12
-#define I2S_LRCLK 13
-#define I2S_DOUT 11
+#define I2S_BCLK					12
+#define I2S_LRCLK					13
+#define I2S_DOUT					11
 
-#define TAS2563_I2C_ADDR 0x4C
+#define TAS2563_I2C_ADDR 			0x4C
 
-#define I2C_MASTER_SDA 17
-#define I2C_MASTER_SCL 18
-#define I2C_MASTER_FREQ_HZ 400000
-
-/* Size of buffer */
-#define BUF_SIZE       	256
-#define RX_BUF_SIZE		1024*4
-
-
-
-static i2c_master_bus_handle_t i2c_bus = NULL;
-static i2c_master_dev_handle_t tas2563_handle = NULL;
-static i2s_chan_handle_t tx_chan; 
+#define I2C_MASTER_SDA 				17
+#define I2C_MASTER_SCL 				18
+#define I2C_MASTER_FREQ_HZ 			400000
 
 static const gpio_num_t pins[] = 
 {
-	//	 LED_PIN		   
+	//	 LED_PIN	  //	CHEAP_SELECT
     GPIO_NUM_6,  GPIO_NUM_21 
 };
 
 #define NUM_PINS (sizeof(pins)/sizeof(pins[0]))
 
-#define RINGBUF_SIZE   (8*1024)
-static volatile size_t rb_head = 0;
-static volatile size_t rb_tail = 0;
-static volatile bool rb_full = false;
-static volatile bool rb_active = false;   
-static volatile bool rb_new_song = false;
+/* Ring and Basket Buffer */
+#define	RING_BUF_POW				12
+#define	BASCKET_BUF_POW				13
 
+#define SPI_BUF_SIZE				(1024 * 4)
+#define RINGBUF_SIZE				(1 << RING_BUF_POW)
+#define BASKET_SIZE					(1 << BASCKET_BUF_POW)
+
+typedef enum
+{
+	RBS_READY_FOR_WRITE				= 0,
+	RBS_WRITING						= 1,
+	RBS_READY_FOR_BROADCAST			= 2,
+	RBS_ON_AIR						= 3,
+	RBS_READY_FOR_READ				= 4,
+	RBS_READING						= 5
+	
+} rbState;
+
+
+typedef struct
+{
+    volatile 		rbState state;
+    uint8_t 		ringBuf [RINGBUF_SIZE];
+    uint8_t 		send_id;
+    
+}	rb;
+
+typedef struct
+{
+    volatile size_t tail;
+    volatile size_t head;
+    uint8_t 		buf [BASKET_SIZE];
+    
+}	b;
+
+rb ringBuf1, ringBuf2;
+b basket, basket_udp;
+
+
+/* Handles */
+
+static i2c_master_bus_handle_t i2c_bus = NULL;
+static i2c_master_dev_handle_t tas2563_handle = NULL;
+static i2s_chan_handle_t tx_chan; 
+
+/* UDP unicast */
+#define PACKET_SIZE					4096
+#define FRAGMENTS_PER_FRAME			(4 * 1)
+#define FRAG_SIZE					(PACKET_SIZE / FRAGMENTS_PER_FRAME)
+
+uint8_t PCM_Buffer [PACKET_SIZE];
+
+typedef struct 
+{
+    uint32_t	frame_id;
+    			
+    uint8_t  	fragment_id;      
+    uint16_t 	data_len;
+//    			crc16;     
+    uint8_t  	pcm_data [FRAG_SIZE];
+    
+} udp_frag_t;
+
+/* TAG */ 
 #ifdef S3_MASTER
 	static const char *TAG = "Master";
-	
-	static uint8_t ringBuf[RINGBUF_SIZE];
-	int16_t i2s_buf[1024]; 
-	WORD_ALIGNED_ATTR uint8_t rx_buf[RX_BUF_SIZE]; 
-	
 #else
 	static const char *TAG = "Slave";
 #endif
 
+
+static ui16 CRC16_Calculate (ui8 const *data, ui16 length)
+ {
+  ui16 CRC_Register = 0;
+  ui8 shiftRegister, dataBit, CRC_Bit;
+
+  for (ui16 i = 0; i < length; i++)
+  {
+   for (shiftRegister = 1; shiftRegister > 0; shiftRegister <<= 1)
+   {
+    dataBit = (data[i] & shiftRegister) ? 1 : 0;
+    CRC_Bit = CRC_Register >> 15;
+    CRC_Register <<= 1;
+
+    if (dataBit != CRC_Bit)
+     CRC_Register ^= 0x8005;
+   }
+  }
+
+  return CRC_Register;
+ }
+ 
 
 static esp_err_t tas2563_write_reg (uint8_t reg, uint8_t value)
 {
@@ -91,65 +185,44 @@ static esp_err_t tas2563_write_reg (uint8_t reg, uint8_t value)
 }
 
 
-static esp_err_t tas2563_read_reg (uint8_t reg, uint8_t *value)
+static inline void cbuf_write_u8_p2 (uint8_t *buf, size_t size, volatile size_t *wr,
+                                    const uint8_t *src, size_t n)
 {
-    esp_err_t ret = i2c_master_transmit(tas2563_handle, &reg, 1, 100);
-    if (ret != ESP_OK) return ret;
-    return i2c_master_receive(tas2563_handle, value, 1, 100);
+    const size_t mask = size - 1;
+    size_t p = (*wr) & mask;
+
+    size_t first = size - p;           
+    if (first > n) first = n;
+
+    memcpy(buf + p, src, first);       
+    if (n > first) memcpy(buf, src + first, n - first);  
+    
+
+    *wr = (*wr + n) & mask;             
 }
 
 
-void rb_reset (void)
+static inline void cbuf_read_u8_p2 (const uint8_t *buf, size_t size, volatile size_t *tail,
+                                   uint8_t *dst, size_t n)
 {
-    rb_head = 0;
-    rb_tail = 0;
-    rb_full = false;
-    rb_active = false;
-    rb_new_song = false;
-    memset(ringBuf, 0, sizeof(ringBuf));
-}
+    const size_t mask = size - 1;
+    size_t p = (*tail) & mask;
 
+    size_t first = size - p;
+    if (first > n) first = n;
 
-static void rb_write (const uint8_t *data, size_t len)
-{
-    for (size_t i = 0; i < len; i++)
+    memcpy(dst, buf + p, first);
+
+    if (n > first)
     {
-        ringBuf[rb_head] = data[i];
-        rb_head = (rb_head + 1) % RINGBUF_SIZE;
-
-        if (rb_full) 
-        {
-            rb_tail = (rb_tail + 1) % RINGBUF_SIZE; 
-        }
-
-        if (rb_head == rb_tail)
-            rb_full = true;
-
-        if (rb_full && !rb_active)
-            rb_active = true; 
-    }
-}
-
-static size_t rb_read (uint8_t *dst, size_t len)
-{
-    if (!rb_active) return 0; 
-
-    size_t bytes_read = 0;
-    for (size_t i = 0; i < len; i++)
-    {
-        if (rb_head == rb_tail && !rb_full) break; 
-
-        dst[i] = ringBuf[rb_tail];
-        rb_tail = (rb_tail + 1) % RINGBUF_SIZE;
-        rb_full = false;
-        bytes_read++;
+        memcpy(dst + first, buf, n - first);
     }
 
-    return bytes_read;
+    *tail = (*tail + n) & mask;
 }
 
 
-static esp_err_t i2c_init(void)
+static esp_err_t i2c_init (void)
 {
     i2c_master_bus_config_t bus_config = {
         .clk_source = I2C_CLK_SRC_DEFAULT,
@@ -184,7 +257,7 @@ void spi_slave_init (void)
         .sclk_io_num = PIN_SCLK,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
-        .max_transfer_sz = RX_BUF_SIZE,
+        .max_transfer_sz = SPI_BUF_SIZE,
     };
 
     spi_slave_interface_config_t slvcfg = {
@@ -192,154 +265,36 @@ void spi_slave_init (void)
         .spics_io_num = PIN_CS,
         .flags = 0,
         .queue_size = 4,
-        .mode = 0,   // SPI mode 0
+        .mode = 0,   
         .post_setup_cb = NULL,
         .post_trans_cb = NULL
     };
-
     
     ESP_ERROR_CHECK(spi_slave_initialize(SPI2_HOST, &buscfg, &slvcfg, SPI_DMA_CH_AUTO));
     ESP_LOGI(TAG, "SPI Slave initialized");
 }
 
-
-void spi_slave_task (void* arg)
-{
-	esp_err_t ret;
-	 
-    spi_slave_transaction_t t;
-    memset(&t, 0, sizeof(t));
-	t.length = sizeof(rx_buf) * 8;
-    t.tx_buffer = NULL;
-    t.rx_buffer = rx_buf;
-    
-    while (1)
-     {
-        ret = spi_slave_transmit(SPI2_HOST, &t, portMAX_DELAY);
-        if (ret == ESP_OK) 
-        {
-			rb_write(rx_buf, sizeof(rx_buf));
-//			ESP_LOGW(TAG, "SPI recv %d", rx_buf[5]);
-		}
-		vTaskDelay(1);
-    }
-}
-
 #endif
 
 
-static void TAS2563_Init (void)
-{
-	ESP_LOGI(TAG, "Init start TAS2563");
-	
-	ESP_ERROR_CHECK(tas2563_write_reg(0, 0));
-	
-	ESP_ERROR_CHECK(tas2563_write_reg(0x01, 0x01)); // reset
-	vTaskDelay(100);
-	
-	ESP_ERROR_CHECK(tas2563_write_reg(0x02, 0x0E)); // Software shutdown
-	vTaskDelay(10);
-	
-	ESP_ERROR_CHECK(tas2563_write_reg(0x07, 0x00));
-	
-	ESP_ERROR_CHECK(tas2563_write_reg(0x08, 0x18)); 
-	
- 	ESP_ERROR_CHECK(tas2563_write_reg(0x02, 0x00)); // Turn ON
-
-	
-    ESP_LOGI(TAG, "Init end TAS2563");
-}
-
-void tas_error (void)
-{
-    uint8_t val;
-    esp_err_t err;
-
-	tas2563_write_reg(0x27, 0x00);
-	tas2563_write_reg(0x28, 0x00);
-	tas2563_write_reg(0x29, 0x00);
-	tas2563_write_reg(0x2A, 0x00);
-	tas2563_write_reg(0x2B, 0x00);
-	tas2563_write_reg(0x2C, 0x00);
-	tas2563_write_reg(0x2D, 0x00);
-	tas2563_write_reg(0x2E, 0x00);
-	tas2563_write_reg(0x2F, 0x00);
-	tas2563_write_reg(0x30, 0x00);
-	
-    ESP_LOGI(TAG, "=== TAS2563 STATUS CHECK ===");
-
-    // 0x27 - FAULT_STATUS
-    if ((err = tas2563_read_reg(0x27, &val)) == ESP_OK)
-        ESP_LOGI(TAG, "FAULT_STATUS(0x27) = 0x%02X", val);
-    else ESP_LOGE(TAG, "Read 0x27 failed (%s)", esp_err_to_name(err));
-
-    // 0x28 - IRQ_STATUS_1
-    if ((err = tas2563_read_reg(0x28, &val)) == ESP_OK)
-        ESP_LOGI(TAG, "IRQ_STATUS_1(0x28) = 0x%02X", val);
-    else ESP_LOGE(TAG, "Read 0x28 failed (%s)", esp_err_to_name(err));
-
-    // 0x29 - IRQ_STATUS_2
-    if ((err = tas2563_read_reg(0x29, &val)) == ESP_OK)
-        ESP_LOGI(TAG, "IRQ_STATUS_2(0x29) = 0x%02X", val);
-    else ESP_LOGE(TAG, "Read 0x29 failed (%s)", esp_err_to_name(err));
-
-    // 0x2A - TEMP_WARNING_STATUS
-    if ((err = tas2563_read_reg(0x2A, &val)) == ESP_OK)
-        ESP_LOGI(TAG, "TEMP_STATUS(0x2A) = 0x%02X", val);
-    else ESP_LOGE(TAG, "Read 0x2A failed (%s)", esp_err_to_name(err));
-
-    // 0x2B - PWR_STATUS
-    if ((err = tas2563_read_reg(0x2B, &val)) == ESP_OK)
-        ESP_LOGI(TAG, "POWER_STATUS(0x2B) = 0x%02X", val);
-    else ESP_LOGE(TAG, "Read 0x2B failed (%s)", esp_err_to_name(err));
-
-    // 0x2C - CLOCK_STATUS
-    if ((err = tas2563_read_reg(0x2C, &val)) == ESP_OK)
-        ESP_LOGI(TAG, "CLOCK_STATUS(0x2C) = 0x%02X", val);
-    else ESP_LOGE(TAG, "Read 0x2C failed (%s)", esp_err_to_name(err));
-
-    // 0x2D - TDM_ERROR_STATUS
-    if ((err = tas2563_read_reg(0x2D, &val)) == ESP_OK)
-        ESP_LOGI(TAG, "TDM_ERROR_STATUS(0x2D) = 0x%02X", val);
-    else ESP_LOGE(TAG, "Read 0x2D failed (%s)", esp_err_to_name(err));
-
-    // 0x2E - BOOST_STATUS
-    if ((err = tas2563_read_reg(0x2E, &val)) == ESP_OK)
-        ESP_LOGI(TAG, "BOOST_STATUS(0x2E) = 0x%02X", val);
-    else ESP_LOGE(TAG, "Read 0x2E failed (%s)", esp_err_to_name(err));
-
-    // 0x2F - PLL_STATUS
-    if ((err = tas2563_read_reg(0x2F, &val)) == ESP_OK)
-        ESP_LOGI(TAG, "PLL_STATUS(0x2F) = 0x%02X", val);
-    else ESP_LOGE(TAG, "Read 0x2F failed (%s)", esp_err_to_name(err));
-
-    // 0x30 - DIE_TEMP (опционально)
-    if ((err = tas2563_read_reg(0x30, &val)) == ESP_OK)
-        ESP_LOGI(TAG, "DIE_TEMP(0x30) = 0x%02X (~%.1f°C)", val, (float)val * 0.75f);
-    else ESP_LOGE(TAG, "Read 0x30 failed (%s)", esp_err_to_name(err));
-
-    ESP_LOGI(TAG, "==============================");
-}
 /* I2S */
-//static i2s_chan_handle_t tx;
-
 static void i2s_init (void) 
 {
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &tx_chan, NULL));
 
     i2s_tdm_config_t tdm = {
-        .clk_cfg  = I2S_TDM_CLK_DEFAULT_CONFIG(48000),   // Fs = 48 kHz
+        .clk_cfg  = I2S_TDM_CLK_DEFAULT_CONFIG(44100),
         .slot_cfg = {
             .data_bit_width   = I2S_DATA_BIT_WIDTH_16BIT,   
             .slot_bit_width   = I2S_SLOT_BIT_WIDTH_16BIT,   
             .slot_mode        = I2S_SLOT_MODE_STEREO,
-            .total_slot       = 1,                          
-            .slot_mask        = I2S_TDM_SLOT0,              
-            .ws_width         = 16,                         // ширина FSYNC = 1 слот × 16
+            .total_slot       = 2,                          
+            .slot_mask        = I2S_TDM_SLOT0 | I2S_TDM_SLOT1,              
+            .ws_width         = 16,                         
             .ws_pol           = false,                      
-            .bit_shift        = false,                      	// MSB на первом такте слота
-            .left_align       = true,             			// I2S-подобное выравнивание
+            .bit_shift        = false,                     
+            .left_align       = false,             			
             .big_endian       = false,
             .bit_order_lsb    = false,
             .skip_mask        = false,
@@ -351,7 +306,6 @@ static void i2s_init (void)
             .dout = I2S_DOUT,                            
             .din  = I2S_GPIO_UNUSED,
             .invert_flags = { 0 },
-            .invert_flags.bclk_inv = true,
         },
     };
 
@@ -360,315 +314,551 @@ static void i2s_init (void)
 }
 
 
-static void i2s_task(void *arg)
+#define ping false
+#define pong true
+
+#ifdef S3_MASTER
+
+bool pingpong = ping;
+uint8_t spiBuf [SPI_BUF_SIZE];
+
+void spi_slave_task (void* arg)
+{
+	esp_err_t ret;
+    spi_slave_transaction_t t;
+    
+    memset(&t, 0, sizeof(t));
+	t.length = SPI_BUF_SIZE * 8;
+    t.tx_buffer = NULL;
+    t.rx_buffer = spiBuf;
+    
+    size_t recLength;
+    
+    bool order = ping;
+    
+    while (1)
+    {
+		if (calcFreeSpaceFIFO(basket.tail, basket.head, BASKET_SIZE) >= SPI_BUF_SIZE)
+		{
+			ret = spi_slave_transmit(SPI2_HOST, &t, portMAX_DELAY);
+	        recLength = t.length / 8;
+	        
+	        if ((ret == ESP_OK) && recLength) 
+	        {
+				cbuf_write_u8_p2(basket.buf, BASKET_SIZE, &basket.head, t.rx_buffer, recLength);
+				
+				cbuf_write_u8_p2(basket_udp.buf, BASKET_SIZE, &basket_udp.head, t.rx_buffer, recLength);
+				
+				if (BASKET_SIZE - calcFreeSpaceFIFO(basket.tail, basket.head, BASKET_SIZE) >= RINGBUF_SIZE)
+				{
+					if ((ringBuf1.state == RBS_READY_FOR_WRITE) && (order == ping))
+					{
+						ringBuf1.state = RBS_WRITING;
+					
+//						ESP_LOGE("B ", "1 ");
+						
+						cbuf_read_u8_p2(basket.buf, BASKET_SIZE, &basket.tail, ringBuf1.ringBuf, RINGBUF_SIZE);
+						
+						ringBuf1.state = RBS_READY_FOR_READ;
+						
+						order = pong;
+					}
+					
+					else if ((ringBuf2.state == RBS_READY_FOR_WRITE) && (order == pong))
+					{
+						ringBuf2.state = RBS_WRITING;
+					
+//						ESP_LOGE("B ", "2 ");
+						
+						cbuf_read_u8_p2(basket.buf, BASKET_SIZE, &basket.tail, ringBuf2.ringBuf, RINGBUF_SIZE);
+						
+						ringBuf2.state = RBS_READY_FOR_READ;
+						
+						order = ping;
+					}
+				}
+			}
+		}
+		
+//		vTaskDelay(1);
+		vPortYield();
+    }
+}
+#endif
+
+
+static void i2s_task (void *arg)
 {
 	ESP_LOGI(TAG, "i2s transmit start");
 	
+	size_t written;
+	
+	bool order = ping;
+	
+	while (!((ringBuf1.state == RBS_READY_FOR_READ) && (ringBuf2.state == RBS_READY_FOR_READ)))
+		vTaskDelay(1);
+		
+	ESP_LOGI(TAG, "i2s Buffers ready");
+	
     while (1) 
     {
-		
-		if (rb_new_song)
+		if ((ringBuf1.state == RBS_READY_FOR_READ) && (order == ping))
 		{
-            rb_reset();          
-            rb_new_song = false;
-        }
-
-        if (rb_active) 
-        {
-            size_t got = rb_read((uint8_t*)i2s_buf, sizeof(i2s_buf));
-            if (got > 0) 
-            {
-                size_t written;
-                i2s_channel_write(tx_chan, i2s_buf, got, &written, 10);
-            }
-        }
-        
+			ringBuf1.state = RBS_READING;
+			
+			i2s_channel_write(tx_chan, ringBuf1.ringBuf, RINGBUF_SIZE, &written, portMAX_DELAY);
+			
+			ringBuf1.state = RBS_READY_FOR_WRITE;
+			
+			order = pong;
+		}
+		
+        else if ((ringBuf2.state == RBS_READY_FOR_READ) && (order == pong))
+		{
+			ringBuf2.state = RBS_READING;
+			
+			i2s_channel_write(tx_chan, ringBuf2.ringBuf, RINGBUF_SIZE, &written, portMAX_DELAY);
+			
+			ringBuf2.state = RBS_READY_FOR_WRITE;
+			
+			order = ping;
+		}
+		
+//		vPortYield();
 		vTaskDelay(1);
-    }
+	}
 }
 
 
-/* Wi-Fi Hendler */
-static void wifi_event_handler (void* arg, esp_event_base_t event_base,
-                               int32_t event_id, void* event_data)
+static void TAS2563_Init (void)
 {
-    if (event_base == WIFI_EVENT)
-     {
-        switch (event_id) 
-        {
-            case WIFI_EVENT_AP_START:
-            {
-                ESP_LOGI(TAG, "SoftAP started");
-                break;
-			}
-			
-            case WIFI_EVENT_AP_STOP:
-            {
-                ESP_LOGI(TAG, "SoftAP stopped");
-                break;
-			}
-			
-            case WIFI_EVENT_AP_STACONNECTED: 
-            {
-                wifi_event_ap_staconnected_t* event = (wifi_event_ap_staconnected_t*) event_data;
-                ESP_LOGI(TAG, "Client connected: MAC="MACSTR", AID=%d",
-                         MAC2STR(event->mac), event->aid);
-                break;
-            }
+	ESP_LOGI(TAG, "Init start TAS2563");
+	
+	gpio_set_level(pins[1], 0);
+    vTaskDelay(100);
+    gpio_set_level(pins[1], 1);
+    vTaskDelay(100);
+	
+	ESP_ERROR_CHECK(tas2563_write_reg(0, 0));
+	
+	ESP_ERROR_CHECK(tas2563_write_reg(0x01, 0x01)); // reset
+	vTaskDelay(10);
+	
+	ESP_ERROR_CHECK(tas2563_write_reg(0, 0));
+	ESP_ERROR_CHECK(tas2563_write_reg(0x02, 0x0E)); // Software shutdown
+	vTaskDelay(10);
+	
+	ESP_ERROR_CHECK(tas2563_write_reg(0, 0));
+	ESP_ERROR_CHECK(tas2563_write_reg(0x04, 0x08));  // IRQ internal pull-up
+	
+	ESP_ERROR_CHECK(tas2563_write_reg(0, 0));
+	ESP_ERROR_CHECK(tas2563_write_reg(0x06, 0x09));  // 44.1/48 kHz, FSYNC High to Low
+	
+	ESP_ERROR_CHECK(tas2563_write_reg(0, 0));
+	ESP_ERROR_CHECK(tas2563_write_reg(0x07, 0x00));
+	
+	ESP_ERROR_CHECK(tas2563_write_reg(0, 0));
+	ESP_ERROR_CHECK(tas2563_write_reg(0x08, 0x30));  //  Stereo downmix (L+R)/2
+	
+	ESP_ERROR_CHECK(tas2563_write_reg(0, 0));
+ 	ESP_ERROR_CHECK(tas2563_write_reg(0x02, 0x0C)); // Turn ON
+ 	
+ 	ESP_ERROR_CHECK(tas2563_write_reg(0, 0));
+	ESP_ERROR_CHECK(tas2563_write_reg(0x7F, 0x00));
+	
+	ESP_ERROR_CHECK(tas2563_write_reg(0, 1));
+	ESP_ERROR_CHECK(tas2563_write_reg(0x08, 0x00));  //Thermal Foldback is disabled
+	
+	ESP_ERROR_CHECK(tas2563_write_reg(0, 2));
+	
+	// -30dB
+	ESP_ERROR_CHECK(tas2563_write_reg(0x0C, 0x16));  // MSB
+	ESP_ERROR_CHECK(tas2563_write_reg(0x0D, 0x4E));
+	ESP_ERROR_CHECK(tas2563_write_reg(0x0E, 0xFB));
+	ESP_ERROR_CHECK(tas2563_write_reg(0x0F, 0xD6));  // LSB
 
-            case WIFI_EVENT_AP_STADISCONNECTED:
-             {
-                wifi_event_ap_stadisconnected_t* event = (wifi_event_ap_stadisconnected_t*) event_data;
-                ESP_LOGI(TAG, "Client disconnected: MAC="MACSTR", AID=%d",
-                         MAC2STR(event->mac), event->aid);
-                break;
-            }
-            
-            case WIFI_EVENT_STA_START:
-            {
-				esp_wifi_connect();
-				ESP_LOGI(TAG, "Station started"); 
-				break;
-			}
-			
-			case WIFI_EVENT_STA_CONNECTED:
-			{
-				ESP_LOGI(TAG, "Station connected to AP");
-				break;
-    		}
-    		
-            case WIFI_EVENT_STA_DISCONNECTED:
-            {
-				wifi_event_sta_disconnected_t* disconn = (wifi_event_sta_disconnected_t*)event_data;
-    			ESP_LOGW(TAG, "Disconnected from AP, reason: %d", disconn->reason);
-				esp_wifi_connect();
-				break;
-			}
-			
-			case IP_EVENT_STA_GOT_IP:
-            {
-				ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
-        		ESP_LOGI(TAG, "Got IP:" IPSTR, IP2STR(&event->ip_info.ip));
-        		break;
-			}
-			
-            default:
-                ESP_LOGI(TAG, "Unhandled WiFi event: %ld", (long)event_id);
-                break;
-        }
-    }
-    
-    if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
-    {
-        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
-        ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
-    }
+	ESP_ERROR_CHECK(tas2563_write_reg(0, 0));
+	ESP_ERROR_CHECK(tas2563_write_reg(0x30, 0x05));
+    ESP_LOGI(TAG, "Init end TAS2563");
 }
 
 
-/* Wi-Fi init */
-static void wifi_init (void)
+typedef enum
 {
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_ap();
+	FRAME_RELOAD = 0,
+	FRAME_PROCESS_UP = 1,
+	FRAME_PROCESS_DOWN = 2,
+	
+}	frameState_t;
 
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-	#ifdef S3_MASTER
-	
-	ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
-													 ESP_EVENT_ANY_ID,
-													 &wifi_event_handler,
-													 NULL,
-													 NULL));
-													 
-	#else
-	
-	
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
-                                                        ESP_EVENT_ANY_ID,
-                                                        &wifi_event_handler,
-                                                        NULL,
-                                                        NULL));
-                                                        
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
-                                                        IP_EVENT_STA_GOT_IP,
-                                                        &wifi_event_handler,
-                                                        NULL,
-                                                        NULL));
-                                                        
-    #endif
-    
-    wifi_config_t wifi_config = {
-		
-		#ifdef S3_MASTER
-		
-        .ap = {
-            .ssid = WIFI_SSID,
-            .ssid_len = strlen(WIFI_SSID),
-            .channel = 1,                        
-            .password = WIFI_PASS,
-            .max_connection = MAX_STA_CONN,
-            .authmode = WIFI_AUTH_WPA_WPA2_PSK,
-//            .sae_pwe_h2e = WPA3_SAE_PWE_BOTH,
-            .pmf_cfg = {
-                .required = false,
-            },
-         }, 
-         
-        #else
-        
-        .sta = {
-            .ssid = WIFI_SSID,
-            .password = WIFI_PASS,
-            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
-        },
-        
-        #endif
+void udp_transmit_task (void *pvParameters)
+{
+       struct sockaddr_in dest_addr = {
+        .sin_family = AF_INET,
+        .sin_port   = htons(SERVER_PORT),
+        .sin_addr.s_addr = inet_addr(BROADCAST_IP)
     };
-	
-	#ifdef S3_MASTER
-	
-    if (strlen(WIFI_PASS) == 0) {
-        wifi_config.ap.authmode = WIFI_AUTH_OPEN;
-    }
-	
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
-    
-    #else 
-    
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-    
-    #endif
-    
-    ESP_ERROR_CHECK(esp_wifi_start());
-
-    ESP_LOGI(TAG, "WiFi started. SSID:%s password:%s", WIFI_SSID, WIFI_PASS);
-}
-
-/*  UDP task */
-#ifdef S3_MASTER
-
-//static void udp_server_task (void *pvParameters)
-//{
-//    struct sockaddr_in dest_addr;
-//    dest_addr.sin_addr.s_addr = htonl(INADDR_BROADCAST); 
-//    dest_addr.sin_family = AF_INET;
-//    dest_addr.sin_port = htons(SERVER_PORT);
-//
-//    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
-//    if (sock < 0) {
-//        ESP_LOGE(TAG, "Unable to create socket");
-//        vTaskDelete(NULL);
-//    }
-//
-//    while (1)
-//     {
-//        sendto(sock, tx_buf, sizeof(tx_buf), 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
-//        ESP_LOGI(TAG, "Data sent (%d bytes)", sizeof(tx_buf));
-//        
-//        vTaskDelay(pdMS_TO_TICKS(1000));
-//    }
-//}
-
-#else
-
-static void udp_client_task (void *pvParameters)
-{
-    uint16_t rx_buffer[BUF_SIZE];
-    struct sockaddr_in dest_addr;
-    dest_addr.sin_addr.s_addr = inet_addr(SERVER_IP);
-    dest_addr.sin_family = AF_INET;
-    dest_addr.sin_port = htons(SERVER_PORT);
 
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
-    if (sock < 0)
+    if (sock < 0) 
     {
-        ESP_LOGE(TAG, "Unable to create socket: errno %d", errno);
+        ESP_LOGE(TAG, "socket create failed");
         vTaskDelete(NULL);
-        return;
     }
-    ESP_LOGI(TAG, "Socket created, waiting for data...");
 
-    while (1) 
+    int broadcastEnable = 1;
+    setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcastEnable, sizeof(broadcastEnable));
+
+	int sndbuf = 1024 * 128;
+    setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+    
+    ESP_LOGI(TAG, "UDP broadcast start to %s:%d", BROADCAST_IP, SERVER_PORT);
+	vTaskDelay(2000);
+	
+	frameState_t frameState = FRAME_RELOAD;
+    int frame_id = 0;
+    char fragment_id = 0;
+    udp_frag_t packet;
+    
+    while (1)
     {
-        struct sockaddr_in source_addr;
-        socklen_t socklen = sizeof(source_addr);
-        int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer) - 1, 0,
-                           (struct sockaddr *)&source_addr, &socklen);
-
-        if (len > 0)
-        {
-            rx_buffer[len] = 0; 
-            ESP_LOGI(TAG, "Received: %d", rx_buffer[8]);
-        } 
-        else 
-        {
-            ESP_LOGW(TAG, "recvfrom failed: errno %d", errno);
+		if (frameState == FRAME_RELOAD)
+		{
+			while ((BASKET_SIZE - calcFreeSpaceFIFO(basket_udp.tail, basket_udp.head, BASKET_SIZE)) < PACKET_SIZE)
+				vTaskDelay(1);
+				
+			cbuf_read_u8_p2(basket_udp.buf, BASKET_SIZE, &basket_udp.tail, PCM_Buffer, PACKET_SIZE);
+			
+			frame_id++;
+			fragment_id = 0;
+			
+	        frameState = FRAME_PROCESS_UP;
         }
+
+		for (ui8 i = 0; i < 12; i++) //12
+		{
+			packet.frame_id = frame_id;
+	        packet.data_len = FRAG_SIZE;
+			packet.fragment_id = fragment_id;
+			
+			memcpy(packet.pcm_data, &PCM_Buffer[FRAG_SIZE * fragment_id], FRAG_SIZE);
+			
+			size_t pkt_len = offsetof(udp_frag_t, pcm_data) + packet.data_len;
+			
+	    	int sent = sendto(sock, &packet, pkt_len, 0,
+	                         (struct sockaddr*)&dest_addr, sizeof(dest_addr));
+	
+	        if (sent < 0)
+	        {
+	            if (errno == ENOMEM || errno == EAGAIN)
+	            {
+//	                ESP_LOGE("T ", "E ");
+	                vTaskDelay(10);
+                }
+	        }
+	        
+	        else
+	        {
+				if (frameState == FRAME_PROCESS_UP)
+					fragment_id++;
+					
+				else if (frameState == FRAME_PROCESS_DOWN)
+					fragment_id--;
+					
+				if (fragment_id >= 4)
+				{
+					frameState = FRAME_PROCESS_DOWN;
+					fragment_id = 3;
+				}
+				
+				else if (fragment_id < 0)
+				{
+					frameState = FRAME_PROCESS_UP;
+					fragment_id = 0;
+				}
+			}
+		}
+		
+		frameState = FRAME_RELOAD;
     }
 
     close(sock);
     vTaskDelete(NULL);
 }
 
-#endif
 
-#define SAMPLE_RATE     48000
-#define TONE_FREQ_HZ    1000
-#define AMPLITUDE       30000
-#define BUF_LEN         256
-
-static void test (void *pvParameters)
+typedef enum
 {
-    ESP_LOGI("TESTE", "Generating sine wave");
+	PACK_PROCESS = 0,
+	PACK_READY = 1,
+	PACK_FINISHED = 2
+	
+}	pasketState_t;
 
-    static int16_t i2s_buf[BUF_LEN];
-    float phase = 0.0f;
-    const float delta = 2.0f * M_PI * TONE_FREQ_HZ / SAMPLE_RATE;
 
+void udp_receive_task (void *pvParameters)
+{
+    struct sockaddr_in listen_addr = {
+        .sin_family = AF_INET,
+        .sin_port   = htons(SERVER_PORT),
+        .sin_addr.s_addr = htonl(INADDR_ANY)
+    };
+
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (sock < 0) 
+    {
+        ESP_LOGE(TAG, "socket create failed");
+        vTaskDelete(NULL);
+    }
+
+    int enable = 1;
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable));
+    setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &enable, sizeof(enable));
+
+    if (bind(sock, (struct sockaddr *)&listen_addr, sizeof(listen_addr)) < 0) 
+    {
+        ESP_LOGE(TAG, "bind failed: %d", errno);
+        close(sock);
+        vTaskDelete(NULL);
+    }
+
+    struct timeval tv = { .tv_sec = 0, .tv_usec = 100 };
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+	int rcvbuf = 1024 * 128;
+    setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+    
+    ESP_LOGI(TAG, "UDP receive start on port %d", SERVER_PORT);
+
+	int current_frame = 0;
+    uint8_t rx_buf[sizeof(udp_frag_t)];
+	uint8_t fragments [4] = { 0 };
+	bool order = ping;
+	pasketState_t pasketState = PACK_PROCESS;
+	
     while (1)
     {
-        for (int i = 0; i < BUF_LEN; i++)
-        {
-            i2s_buf[i] = (int16_t)(AMPLITUDE * sinf(phase));
-            phase += delta;
-            if (phase > 2.0f * M_PI)
-                phase -= 2.0f * M_PI;
-        }
+        int len = recvfrom(sock, rx_buf, sizeof(rx_buf), 0, NULL, NULL);
 
-        for (int i = 0; i < BUF_LEN; i++)
+        if (len > 0) 
         {
-            uint16_t s = (uint16_t)i2s_buf[i];
-            i2s_buf[i] = (s >> 8) | (s << 8);
-        }
+            udp_frag_t *p = (udp_frag_t*)rx_buf;
+		
+			if (p->frame_id != current_frame)
+			{
+				pasketState = PACK_PROCESS;
+				current_frame = p->frame_id;
+				memset(fragments, 0, 4);
+			}
+			
+			fragments[p->fragment_id] = 1;
+				
+			if (pasketState == PACK_PROCESS)
+			{
+				if ((fragments[0] + fragments[1] + fragments[2] + fragments[3]) == 4)
+					pasketState = PACK_READY;
+					
+				memcpy(&PCM_Buffer[FRAG_SIZE * p->fragment_id], p->pcm_data, FRAG_SIZE);
+			}
+		
+            if ((calcFreeSpaceFIFO(basket_udp.tail, basket_udp.head, BASKET_SIZE) >= PACKET_SIZE) && (pasketState == PACK_READY))
+			{
+				cbuf_write_u8_p2(basket_udp.buf, BASKET_SIZE, &basket_udp.head, PCM_Buffer, PACKET_SIZE);
+					
+				if (BASKET_SIZE - calcFreeSpaceFIFO(basket_udp.tail, basket_udp.head, BASKET_SIZE) >= RINGBUF_SIZE)
+				{
+					if ((ringBuf1.state == RBS_READY_FOR_WRITE) && (order == ping))
+					{
+						ringBuf1.state = RBS_WRITING;
+					
+						cbuf_read_u8_p2(basket_udp.buf, BASKET_SIZE, &basket_udp.tail, ringBuf1.ringBuf, RINGBUF_SIZE);
+						
+						ringBuf1.state = RBS_READY_FOR_READ;
+						
+						order = pong;
+					}
+					
+					else if ((ringBuf2.state == RBS_READY_FOR_WRITE) && (order == pong))
+					{
+						ringBuf2.state = RBS_WRITING;
+						
+						cbuf_read_u8_p2(basket_udp.buf, BASKET_SIZE, &basket_udp.tail, ringBuf2.ringBuf, RINGBUF_SIZE);
+						
+						ringBuf2.state = RBS_READY_FOR_READ;
+						
+						order = ping;
+					}
+					
+					pasketState = PACK_FINISHED;
+				}
+			}
+		}
+		else 
+			vTaskDelay(1);
+    }
 
-        size_t written = 0;
-        esp_err_t ret = i2s_channel_write(tx_chan, i2s_buf, sizeof(i2s_buf), &written, portMAX_DELAY);
-        if (ret != ESP_OK)
-        {
-            ESP_LOGE("TEST_TONE", "I2S write error: %s", esp_err_to_name(ret));
-            vTaskDelay(pdMS_TO_TICKS(100));
-        }
-        vTaskDelay(pdMS_TO_TICKS(1));
+    close(sock);
+    vTaskDelete(NULL);
+}
+
+static void wifi_ap_event_handler (void* arg, esp_event_base_t event_base,
+                                    int32_t event_id, void* event_data)
+{
+    if (event_id == WIFI_EVENT_AP_STACONNECTED)
+    {
+        wifi_event_ap_staconnected_t* event = (wifi_event_ap_staconnected_t*) event_data;
+        ESP_LOGI(TAG, "station "MACSTR" join, AID=%d", MAC2STR(event->mac), event->aid);
+                 
+        xTaskCreate(udp_transmit_task, "udp_transmit_task", 4096, NULL, 2, NULL);
+    } 
+    else if (event_id == WIFI_EVENT_AP_STADISCONNECTED)
+    {
+        wifi_event_ap_stadisconnected_t* event = (wifi_event_ap_stadisconnected_t*) event_data;
+        ESP_LOGI(TAG, "station "MACSTR" leave, AID=%d, reason=%d", MAC2STR(event->mac), event->aid, event->reason);
     }
 }
 
 
+static int s_retry_num = 0;
 
-// main 
-void app_main(void)
+static void wifi_sta_event_handler (void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data)
 {
-    ESP_ERROR_CHECK(nvs_flash_init());
- 
-//    wifi_init();
-//    esp_wifi_set_max_tx_power(24);
+	switch (event_id)
+	{
+		case WIFI_EVENT_STA_START :
+			if (event_base == WIFI_EVENT)
+				esp_wifi_connect();
+				
+			break;
+		
+		case WIFI_EVENT_STA_DISCONNECTED :
+			if (event_base == WIFI_EVENT)
+			{
+				if (s_retry_num < MAXIMUM_RETRY)
+				{
+				    esp_wifi_connect();
+				    s_retry_num++;
+				    ESP_LOGW(TAG, "retry to connect to the AP (%d/%d)", s_retry_num, MAXIMUM_RETRY);
+				}
+				
+				ESP_LOGW(TAG, "connect to the AP fail");
+			}
+			
+			break;
+		
+		case IP_EVENT_STA_GOT_IP :
+			if (event_base == IP_EVENT)
+			{
+				ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+				ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+				s_retry_num = 0;
+				#ifndef S3_MASTER
+				xTaskCreate(udp_receive_task, "udp_receive_task", 4096, NULL, 2, NULL);
+				#endif
+			}
+			
+			break;
+	
+    	case WIFI_EVENT_AP_STACONNECTED :
+    	{
+	        wifi_event_ap_staconnected_t* event = (wifi_event_ap_staconnected_t*) event_data;
+	        ESP_LOGI(TAG, "station "MACSTR" join, AID=%d",
+	                 MAC2STR(event->mac), event->aid);
+			break;
+		}
+		
+		case WIFI_EVENT_AP_STADISCONNECTED :
+    	{
+	        wifi_event_ap_stadisconnected_t* event = (wifi_event_ap_stadisconnected_t*) event_data;
+	        ESP_LOGI(TAG, "station "MACSTR" leave, AID=%d, reason=%d",
+	                 MAC2STR(event->mac), event->aid, event->reason);
+	        break;
+        }
+    }
+}
+
+
+void wifi_init_ap (void)
+{
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_ap();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+
+	ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                                                        ESP_EVENT_ANY_ID,
+                                                        &wifi_ap_event_handler,
+                                                        NULL,
+                                                        NULL));
+                                                        
+    wifi_config_t wifi_config = {
+        .ap = {
+            .ssid = WIFI_SSID,
+            .ssid_len = strlen(WIFI_SSID),
+            .password = WIFI_PASS,
+            .max_connection = MAX_STA_CONN,
+            .authmode = WIFI_AUTH_WPA_WPA2_PSK,
+            .channel = 6
+        },
+    };
+    if (strlen(WIFI_PASS) == 0) {
+        wifi_config.ap.authmode = WIFI_AUTH_OPEN;
+    }
+
+    esp_wifi_set_mode(WIFI_MODE_AP);
+    esp_wifi_set_config(WIFI_IF_AP, &wifi_config);
     
-	#ifdef S3_MASTER
+    esp_wifi_set_ps(WIFI_PS_NONE);
+	esp_wifi_set_protocol(WIFI_IF_AP, WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+	esp_wifi_config_11b_rate(WIFI_IF_AP, true);
+//	esp_wifi_config_80211_tx_rate(WIFI_IF_AP, WIFI_PHY_RATE_48M);
+
+	esp_wifi_set_ps(WIFI_PS_NONE);
+	
+    esp_wifi_start();
+
+    ESP_LOGI(TAG, "AP started, SSID:%s password:%s", WIFI_SSID, WIFI_PASS);
+}
+
+
+void wifi_init_sta(void)
+{
+    ESP_ERROR_CHECK(esp_netif_init());
+
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+	ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_sta_event_handler, NULL, NULL));
+	ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_sta_event_handler, NULL, NULL));
+
+	wifi_config_t wifi_config = { 0 };
+	snprintf((char *)wifi_config.sta.ssid, sizeof(wifi_config.sta.ssid), "%s", WIFI_SSID);
+    snprintf((char *)wifi_config.sta.password, sizeof(wifi_config.sta.password), "%s", WIFI_PASS);
+    
+	wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+	wifi_config.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
+	wifi_config.sta.pmf_cfg.capable = true;
+	wifi_config.sta.pmf_cfg.required = false;
+
+	ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+	ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+	
+	 esp_wifi_set_ps(WIFI_PS_NONE);
+	
+	ESP_ERROR_CHECK(esp_wifi_start());
+
+	ESP_LOGI(TAG, "Wi-Fi Station is ready. Connecting to SSID:%s", WIFI_SSID);
+}
+
+
+void gpio_init (void)
+{
 	for (int i = 0; i < NUM_PINS; i++)
 	{
 		gpio_config_t io_conf = {};
@@ -686,35 +876,44 @@ void app_main(void)
     vTaskDelay(100);
     gpio_set_level(pins[1], 1);
     vTaskDelay(100);
+}
+
+
+void app_main(void)
+{
+    ESP_ERROR_CHECK(nvs_flash_init());
     
-    i2c_init();
-	spi_slave_init();
-	
-    i2s_init();
-    
-    TAS2563_Init();
-	uint8_t val;
-	tas2563_read_reg(0x06, &val);
-    ESP_LOGI(TAG, "0x06 = 0x%02X", val);
-    tas2563_read_reg(0x07, &val);
-    ESP_LOGI(TAG, "0x07 = 0x%02X", val);
-    tas2563_read_reg(0x08, &val);
-    ESP_LOGI(TAG, "0x08 = 0x%02X", val);
-    tas2563_read_reg(0x09, &val);
-    ESP_LOGI(TAG, "0x09 = 0x%02X", val);
-    tas2563_read_reg(0x06, &val);
-    ESP_LOGI(TAG, "0x06 = 0x%02X", val);
-    tas_error();
-	rb_new_song = true;
-	
-    xTaskCreate(spi_slave_task, "spi_slave_task", 8192, NULL, 5, NULL);
-	xTaskCreate(i2s_task, "i2s_task", 8192, NULL, 4, NULL);
-//	xTaskCreate(test, "test", 4096, NULL, 5, NULL);
-	
-//    xTaskCreate(udp_server_task, "udp_server", 4096, NULL, 5, NULL);
-    
+	#ifdef S3_MASTER
+    wifi_init_ap();
     #else
-    vTaskDelay(pdMS_TO_TICKS(5000));
-    xTaskCreate(udp_client_task, "udp_client", 4096, NULL, 5, NULL);
+    wifi_init_sta();
+    #endif
+    
+    esp_wifi_set_max_tx_power(24);
+
+	gpio_init();
+    i2c_init();
+    i2s_init();
+    TAS2563_Init();
+    
+    #ifdef S3_MASTER
+	spi_slave_init();
 	#endif
+    
+	basket.tail = basket.head = basket_udp.tail = basket_udp.head = 0;
+    memset(basket.buf, 0, BASKET_SIZE);
+    memset(basket_udp.buf, 0, BASKET_SIZE);
+
+	memset(ringBuf1.ringBuf, 0, RINGBUF_SIZE);
+	memset(ringBuf2.ringBuf, 0, RINGBUF_SIZE);
+	
+	ringBuf1.state = ringBuf2.state = RBS_READY_FOR_WRITE;
+	ringBuf1.send_id = ringBuf2.send_id = 0;
+	
+	#ifdef S3_MASTER
+    	xTaskCreate(spi_slave_task, "spi_slave_task", 8192, NULL, 2, NULL);
+	#endif
+	
+	xTaskCreate(i2s_task, "i2s_task", 8192, NULL, 3, NULL);
+	
 }

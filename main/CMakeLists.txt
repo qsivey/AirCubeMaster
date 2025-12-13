@@ -2,12 +2,12 @@
 # for more information about component CMakeLists.txt files.
 
 idf_component_register(
-    SRCS main.c
-    SRCS AirCube.c
-    SRCS tcp.c
-    SRCS wifi.c
-    SRCS common.c
-    SRCS hardware.c
+    SRCS	main.c
+			AirCube.c
+			tcp.c
+			wifi.c
+			common.c
+			hardware.c
     
     INCLUDE_DIRS        # optional, add here public include directories
     PRIV_INCLUDE_DIRS   # optional, add here private include directories

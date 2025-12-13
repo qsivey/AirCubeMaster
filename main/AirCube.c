@@ -16,6 +16,8 @@ AirCube_t AirCube = { 0 };
 
 void AirCubeInit (void)
 {
+	ESP_ERROR_CHECK(nvs_flash_init());
+	
 	GPIO_Init();
 	I2C_Init();
 	I2S_Init();
